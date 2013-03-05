@@ -2,32 +2,99 @@
 
 This requires the patched
 [iproute2](http://www.linuxfoundation.org/collaborate/workgroups/networking/iproute2)
-package available [here](https://github.com/tgrennan/iproute).
+package available [here](https://github.com/tgrennan/iproute2).
 
-### 2x2
+Create and destroy virtual toroids like this.
 
-Here is an example of a single toroid with 2 rows of 2 nodes interconnected
-with vitual ehternet pairs.
+```console
+ip link add type torus toroid 0
+ip link del te0
+```
 
-First create the paired virtual ethernet devices.
+The following example script that is a reference for what is done through the
+virtual toroid device.
 
-````console
-$ sudo ip link add type veth
-$ sudo ip link add type veth
-$ sudo ip link add type veth
-$ sudo ip link add type veth
-$ sudo ip link add type veth
-$ sudo ip link add type veth
-$ sudo ip link add type veth
-$ sudo ip link add type veth
-````
-Now create the nodes with the `veth` ports,
+```bash
+#!/bin/bash
 
-````console
-$ sudo ip link add type torus node 0.0%2 veth0 veth2 veth4 veth6
-$ sudo ip link add type torus node 0.1%2 veth8 veth7 veth10 veth3
-$ sudo ip link add type torus node 0.2%2 veth5 veth12 veth1 veth14
-$ sudo ip link add type torus node 0.3%2 veth11 veth15 veth9 veth13
-````
+# create virtual toroid
 
-FIXME with the rest.
+prog=${0##*/}
+
+declare -i rows=3
+declare -i cols=3
+op=create
+
+while [ $# -gt 0 ] ; do
+	case "$1" in
+		-h | --help)
+			op=usage
+			;;
+		-n | --dry-run)
+			ip () {
+				echo ip $*
+			}
+			;;
+		--delete)
+			op=delete
+			;;
+		*x*)	rows=${1%x*}
+			cols=${1#*x}
+			;;
+		*)	break;;
+	esac
+	shift
+done
+
+if [ $# -ne 1 ] ; then
+	op=usage
+else
+	declare -r toroid=$1; shift
+fi
+
+declare -r -i nodes=$(( rows * cols))
+declare -i node node neighbor veth
+
+usage () {
+	cat <<-EOF
+	Usage: $prog [-n|--dry-run] [--delete] [ROWSxCOLS] TOROID
+	EOF
+}
+
+create () {
+	# create rows*cols nodes plus 2 pairs of veth devices
+	for ((node=0; node<nodes; node++)) ; do
+		ip link add torus node $toroid.$node
+		ip link add veth
+		ip link add veth
+	done
+	# assign veth pairs to north-south, east-west nodes
+	for ((node=0; node<nodes; node++)) ; do
+		veth=$(( node * 2 ))
+		ip link set dev veth$veth master te$toroid.$node
+		neighbor=$(( (node + cols) % nodes ))
+		ip link set dev veth$(( veth + 1 )) master te$toroid.$neighbor
+		veth=$(( veth + (nodes * 2) ))
+		ip link set dev veth$veth master te$toroid.$node
+		neighbor=$(( node + 1 ))
+		if [[ $(( neighbor % cols )) -eq 0 ]] ; then
+			neighbor=$(( neighbor - cols ))
+		fi
+		ip link set dev veth$(( veth + 1 )) master te$toroid.$neighbor
+	done
+}
+
+destroy () {
+	for ((node=0; node<nodes; node++)) ; do
+		ip link del te${toroid}.${node}
+	done
+	for ((veth=0; veth < nodes * 2; veth++)) ; do
+		ip link del veth$veth
+	done
+}
+
+eval $op
+```
+
+### FIXME
+With the rest.
