@@ -24,35 +24,25 @@
 			recourse;					\
 		}							\
 	} while(0)
-#define	assert_this_attr(attr)						\
-	assert_this(data[TORUS_ ## attr ##_ATTR],			\
-		    return -EINVAL, "missing %s.\n", # attr)
-#define	assert_this_attr_range(attr,x)					\
-	assert_this((x) >= TORUS_MIN_##attr && (x) <= TORUS_MAX_##attr, \
-		    return -ERANGE, "Out of range %s.\n", # attr)
-#define	this_attr(attr)							\
-	nla_get_u32(data[TORUS_ ## attr ## _ATTR])
-#define	this_optional_attr(attr,default)				\
-	(data[TORUS_ ## attr ## _ATTR])					\
-	? nla_get_u32(data[TORUS_ ## attr ## _ATTR])			\
-	: (default)
-#define	alloc_this_tbl(tbl,n)						\
-	if ((tbl) = kcalloc((n), sizeof(*(tbl)), GFP_KERNEL), !(tbl))	\
-		goto enomem
-#define	clean_this_tbl(tbl)						\
-	do {								\
-		if (tbl) {						\
-			kfree(tbl);					\
-			(tbl) = NULL;					\
-		}							\
-	} while (0)
+#define	assert_this_attr(_attr_)					\
+	assert_this(data[TORUS_##_attr_##_ATTR],			\
+		    return -EINVAL, "missing %s.\n", #_attr_)
+#define	assert_this_attr_range(_attr,x)					\
+	assert_this((x) >= TORUS_MIN_##_attr 				\
+		    && (x) <= TORUS_MAX_##_attr,			\
+		    return -ERANGE, "Out of range %s.\n", #_attr)
+#define	this_attr(_attr_)						\
+	nla_get_u32(data[TORUS_##_attr_##_ATTR])
+#define	this_optional_attr(_attr_,_default_)				\
+	(data[TORUS_##_attr_##_ATTR])					\
+	? nla_get_u32(data[TORUS_##_attr_##_ATTR])			\
+	: (_default_)
 
 static const struct nla_policy this_policy[];
 struct rtnl_link_ops torus_rtnl;
 
-
-static struct net_device *this_dev_get_by_name_rcu(struct net *net,
-						   const char *ifname)
+static struct net_device *this_dev_by_name_rcu(struct net *net,
+					       const char *ifname)
 {
 	struct	net_device *dev = NULL;
 
@@ -67,69 +57,78 @@ static struct net_device *this_dev_get_by_name_rcu(struct net *net,
 	return dev;
 }
 
-static struct net_device *this_dev_get_by_name(struct net *net,
-					       const char *ifname)
+static struct net_device *this_dev_by_name(struct net *net, const char *ifname)
 {
 	struct	net_device *dev;
 
 	rcu_read_lock();
-	dev = this_dev_get_by_name_rcu(net, ifname);
+	dev = this_dev_by_name_rcu(net, ifname);
 	rcu_read_unlock();
 	return dev;
 }
 
-static struct net_device *this_dev_get_by_attr_rcu(struct net *net,
-						   const struct nlattr *attr)
+static struct net_device *this_dev_by_attr_rcu(struct net *net,
+					       const struct nlattr *attr)
 {
 	char	ifname[IFNAMSIZ];
 	struct	net_device *dev = NULL;
 
 	if (attr) {
 		nla_strlcpy(ifname, attr, IFNAMSIZ);
-		dev = this_dev_get_by_name_rcu(net, ifname);
+		dev = this_dev_by_name_rcu(net, ifname);
 	}
 	return dev;
 }
 
-static struct net_device *this_dev_get_by_attr(struct net *net,
+static struct net_device *this_dev_by_attr(struct net *net,
 					       const struct nlattr *attr)
 {
 	struct	net_device *dev;
 
 	rcu_read_lock();
-	dev = this_dev_get_by_attr_rcu(net, attr);
+	dev = this_dev_by_attr_rcu(net, attr);
 	rcu_read_unlock();
 	return dev;
 }
 
+static void free_this_nodes_tbls(struct net_device *dev)
+{
+	struct	torus *priv = netdev_priv(dev);
+	int	i, n;
+
+	n = torus_entries(priv->node.nodelu);
+	for (i = 0; i < n; i++) {
+		kfree(priv->node.nodelu[i]);
+		priv->node.nodelu[i] = NULL;
+	}
+	n = torus_entries(priv->node.portlu);
+	for (i = 0; i < n; i++) {
+		kfree(priv->node.portlu[i]);
+		priv->node.portlu[i] = NULL;
+	}
+	kfree(priv->node.clone_dev);
+	priv->node.clone_dev = NULL;
+}
+
 static void this_destructor(struct net_device *dev)
 {
-	struct torus *t = netdev_priv(dev);
+	struct	torus *priv = netdev_priv(dev);
 
-	free_percpu_counters(&t->rx);
-	free_percpu_counters(&t->tx);
-	switch (t->mode) {
-	case TORUS_NODE_DEV:
-		clean_this_tbl(t->node.clone_dev);
-		clean_this_tbl(t->node.port_dev);
-		clean_this_tbl(t->node.toroid2node);
-		clean_this_tbl(t->node.node2port);
-		break;
-	case TORUS_TOROID_DEV:
-		clean_this_tbl(t->toroid.node_dev);
-		break;
-	default:
-		break;
-	}
+	free_percpu_counters(&priv->rx);
+	free_percpu_counters(&priv->tx);
+	if (priv->mode == TORUS_NODE_DEV)
+		free_this_nodes_tbls(dev);
+	else if (priv->mode == TORUS_TOROID_DEV)
+		kfree(priv->toroid.node_dev);
 	free_netdev(dev);
 }
 
 static void this_setup(struct net_device *dev)
 {
-	struct torus *t = netdev_priv(dev);
+	struct	torus *priv = netdev_priv(dev);
 
-	alloc_percpu_counters(&t->rx);
-	alloc_percpu_counters(&t->tx);
+	alloc_percpu_counters(&priv->rx);
+	alloc_percpu_counters(&priv->tx);
 	ether_setup(dev);
 	dev->priv_flags &= ~IFF_TX_SKB_SHARING;
 	dev->netdev_ops = &torus_netdev;
@@ -142,30 +141,34 @@ static void this_setup(struct net_device *dev)
 static inline int this_validate_clone(struct nlattr *tb[],
 				      struct nlattr *data[])
 {
-	struct	net_device *dev;
-	struct	torus *t;
+	struct	net_device *node_dev;
+	struct	torus *node_priv;
 	u32	clone_id;
+	int	i;
 
 	assert_this_attr(NODE);
-	dev = this_dev_get_by_attr(NULL, data[TORUS_NODE_ATTR]);
-	assert_this(dev != NULL, return -ENODEV, "no such node.\n");
-	assert_this(is_torus(dev), return -EINVAL,
-		    "%s isn't a torus device.\n", dev->name);
-	t = netdev_priv(dev);
-	assert_this(t->mode == TORUS_NODE_DEV, return -EINVAL,
-		    "%s isn't a torus node.\n", dev->name);
+	node_dev = this_dev_by_attr(NULL, data[TORUS_NODE_ATTR]);
+	assert_this(node_dev != NULL, return -ENODEV, "no such node.\n");
+	assert_this(is_torus(node_dev), return -EINVAL,
+		    "%s isn't a torus device.\n", node_dev->name);
+	node_priv = netdev_priv(node_dev);
+	assert_this(node_priv->mode == TORUS_NODE_DEV, return -EINVAL,
+		    "%s isn't a torus node.\n", node_dev->name);
+	if (!node_priv->node.clones || !node_priv->node.clone_dev)
+		return -EADDRNOTAVAIL;
 	if (data[TORUS_CLONE_ID_ATTR]) {
 		clone_id =  this_attr(CLONE_ID);
-		assert_this(clone_id < t->node.clones, return -ERANGE,
-			    "%u exceeds %s->clones.\n", clone_id, dev->name);
-		assert_this(t->node.clone_dev[clone_id] == NULL,
+		assert_this(clone_id >= TORUS_MIN_CLONE_ID
+			    && clone_id <= node_priv->node.clones,
+			    return -ERANGE, "Out of range clone ID.\n");
+		assert_this(node_priv->node.clone_dev[clone_id] == NULL,
 			    return -EADDRINUSE, "%u exists.\n", clone_id);
 		return 0;
 	}
-	for_each_torus_clone(clone_id, t->node.clones)
-		if (t->node.clone_dev[clone_id] == NULL)
+	for (i = 0; i < node_priv->node.clones; i++)
+		if (node_priv->node.clone_dev[i] == NULL)
 			return 0;
-	TORUS_ERR("no more clones for %s\n", dev->name);
+	TORUS_ERR("no more clones for %s\n", node_dev->name);
 	return -EADDRNOTAVAIL;
 }
 
@@ -185,7 +188,7 @@ static inline int this_validate_node(struct nlattr *tb[],
 	clones = this_optional_attr(CLONES, TORUS_MIN_CLONES);
 	assert_this_attr_range(CLONES, clones);
 	torus_node_ifname(ifname, toroid_id, node_id);
-	dev = this_dev_get_by_name(NULL, ifname);
+	dev = this_dev_by_name(NULL, ifname);
 	assert_this(dev == NULL, return -ENOTUNIQ, "%s exists.\n", ifname);
 	return 0;
 }
@@ -231,30 +234,34 @@ static inline int this_newlink_clone(struct net *net,
 				     struct nlattr *tb[],
 				     struct nlattr *data[])
 {
-	struct	torus *t = netdev_priv(dev);
-	struct	net_device *master;
-	struct	torus *tn;
-	u32	clone_id;
+	struct	torus *priv = netdev_priv(dev);
+	struct	net_device *master_dev;
+	struct	torus *master_priv;
+	u32	toroid_id, node_id, clone_idx, clones;
 	int	err;
 
-	t = netdev_priv(dev);
-	t->mode = TORUS_CLONE_DEV;
-	master = this_dev_get_by_attr(net, data[TORUS_NODE_ATTR]);
-	tn = netdev_priv(master);
+	priv->mode = TORUS_CLONE_DEV;
+	master_dev = this_dev_by_attr(net, data[TORUS_NODE_ATTR]);
+	master_priv = netdev_priv(master_dev);
+	clones = master_priv->node.clones;
 	if (data[TORUS_CLONE_ID_ATTR])
-		clone_id = this_attr(CLONE_ID);
+		clone_idx = this_attr(CLONE_ID) - 1;
 	else
-		for_each_torus_clone(clone_id, tn->node.clones)
-			if (tn->node.clone_dev[clone_id] == NULL)
+		for (clone_idx = 0; clone_idx < clones; clone_idx++)
+			if (master_priv->node.clone_dev[clone_idx] == NULL)
 				break;
-	t->clone.clone_id = clone_id;
+	priv->clone.clone_id = clone_idx + 1;
+	toroid_id = master_priv->node.toroid_id;
+	node_id = master_priv->node.node_id;
 	torus_set_hw_addr(dev);
-	torus_clone_ifname(dev->name, tn->node.toroid_id, tn->node.node_id,
-			   clone_id);
-	if (err = torus_set_master(master, dev), err < 0)
+	torus_clone_ifname(dev->name, toroid_id, node_id, priv->clone.clone_id);
+	err = torus_set_master(master_dev, dev);
+	if (err < 0)
 		return err;
-	if (err = register_netdevice(dev), err < 0)
+	err = register_netdevice(dev);
+	if (err < 0)
 		return err;
+	torus_create_sysfs(dev);
 	netif_carrier_off(dev);
 	return 0;
 }
@@ -265,30 +272,40 @@ static inline int this_new_node(struct	net *net,
 				u32	node_id,
 				u32	clones)
 {
-	struct	torus *t = netdev_priv(dev);
-	int	err;
+	struct	torus *priv = netdev_priv(dev);
+	int	i, n, err;
 
-	t->mode = TORUS_NODE_DEV;
-	t->node.toroid_id = toroid_id;
-	t->node.node_id = node_id;
+	priv->mode = TORUS_NODE_DEV;
+	spin_lock_init(&priv->node.lock);
+	priv->node.toroid_id = toroid_id;
+	priv->node.node_id = node_id;
 	torus_set_hw_addr(dev);
-	t->node.clones = clones;
-	t->node.clones += 1;
-	alloc_this_tbl(t->node.clone_dev, t->node.clones);
-	alloc_this_tbl(t->node.port_dev, TORUS_PORTS);
-	alloc_this_tbl(t->node.toroid2node, TORUS_TOROIDS);
-	alloc_this_tbl(t->node.node2port, TORUS_NODES);
+	priv->node.clones = clones;
+	n = torus_entries(priv->node.nodelu);
+	for (i = 0; i < n; i++)
+		if (!torus_init_lu_tbl(&priv->node.nodelu[i], TORUS_TOROIDS,
+				       TORUS_NODES))
+			goto enomem;
+	n = torus_entries(priv->node.portlu);
+	for (i = 0; i < n; i++)
+		if (!torus_init_lu_tbl(&priv->node.portlu[i], TORUS_NODES,
+				       TORUS_PORTS))
+			goto enomem;
+	if (clones) {
+		size_t	sz = sizeof(*priv->node.clone_dev);
+		priv->node.clone_dev = kcalloc(clones, sz, GFP_KERNEL);
+		if (!priv->node.clone_dev)
+			goto enomem;
+	}
 	if (err = register_netdevice(dev), err)
 		goto egress;
 	netif_carrier_off(dev);
+	torus_create_sysfs(dev);
 	return 0;
 enomem:
 	err = -ENOMEM;
 egress:
-	clean_this_tbl(t->node.clone_dev);
-	clean_this_tbl(t->node.port_dev);
-	clean_this_tbl(t->node.toroid2node);
-	clean_this_tbl(t->node.node2port);
+	free_this_nodes_tbls(dev);
 	return err;
 }
 
@@ -306,128 +323,149 @@ static inline int this_newlink_node(struct net *net,
 	return this_new_node(net, dev, toroid_id, node_id, clones);
 }
 
-static inline struct net_device *this_new_port(struct	net *oldnet,
-					       struct	net *newnet,
-					       struct	net_device *node_dev,
-					       struct	nlattr *tb[],
-					       int	port_id)
+static inline int this_new_node_ports(struct net *src_net, struct net *new_net,
+				      struct net_device *node_dev,
+				      struct nlattr *tb[])
 {
+	struct	torus *port_priv, *priv = netdev_priv(node_dev);
 	char	ifname[IFNAMSIZ];
-	struct	torus *nt = netdev_priv(node_dev);
-	struct	torus *pt;
 	struct	net_device *port_dev;
+	u32	toroid_id, node_id, port_id;
 	int	err;
 
-	torus_port_ifname(ifname, nt->node.toroid_id, nt->node.node_id,
-			  port_id);
-	port_dev = rtnl_create_link(oldnet, newnet, ifname, &torus_rtnl, tb);
-	if (IS_ERR(port_dev))
-		return ERR_CAST(node_dev);
-	pt = netdev_priv(port_dev);
-	pt->mode = TORUS_PORT_DEV;
-	pt->port.port_id = port_id;
-	err = torus_set_master(node_dev, port_dev);
-	if (err)
-		return ERR_PTR(err);
-	return port_dev;
+	toroid_id = priv->node.toroid_id;
+	node_id = priv->node.node_id;
+	for (port_id = 0; port_id < 4; port_id++) {
+		torus_port_ifname(ifname, toroid_id, node_id, port_id);
+		port_dev = rtnl_create_link(src_net, new_net, ifname,
+					    &torus_rtnl, tb);
+		if (IS_ERR(port_dev))
+		    return PTR_ERR(port_dev);
+		port_priv = netdev_priv(port_dev);
+		port_priv->mode = TORUS_PORT_DEV;
+		port_priv->port.port_id = port_id;
+		err = torus_set_master(node_dev, port_dev);
+		if (err)
+			return err;
+		torus_set_hw_addr(port_dev);
+		err = register_netdevice(port_dev);
+		if (err)
+			return err;
+		netif_carrier_off(port_dev);
+		torus_create_sysfs(port_dev);
+	}
+	return 0;
 }
 
-static inline void this_assign_peers(struct net_device *toroid_dev,
-				     u32 rows, u32 cols)
+static inline int this_new_toroid_nodes(struct net *src_net,
+					struct net_device *dev,
+					struct nlattr *tb[],
+					u32 clones)
 {
-	struct	torus *toroid;
+	struct	torus *priv = netdev_priv(dev);
+	char	ifname[IFNAMSIZ];
+	struct	net *new_net;
+	struct	net_device *node_dev;
+	u32	node_id;
+	int	err;
+
+	new_net = rtnl_link_get_net(src_net, tb);
+	if (IS_ERR(new_net))
+		return PTR_ERR(new_net);
+	for (node_id = 0; node_id < priv->toroid.nodes; node_id++) {
+		torus_node_ifname(ifname, priv->toroid.toroid_id, node_id);
+		node_dev = rtnl_create_link(src_net, new_net, ifname,
+					    &torus_rtnl, tb);
+		if (IS_ERR(node_dev)) {
+			err = PTR_ERR(node_dev);
+			goto egress;
+		}
+		err = this_new_node(new_net, node_dev, priv->toroid.toroid_id,
+				    node_id, clones);
+		if (err)
+			goto egress;
+		err = torus_set_master(dev, node_dev);
+		if (err)
+			goto egress;
+		err = this_new_node_ports(src_net, new_net, node_dev, tb);
+		if (err)
+			goto egress;
+	}
+	err = 0;
+egress:
+	put_net(new_net);
+	return err;
+}
+
+static inline void this_assign_peers(struct torus *priv, u32 rows, u32 cols)
+{
 	struct	net_device *node_dev, *neighbor_node_dev;
 	struct	net_device *port_dev, *neighbor_port_dev;
-       	struct	torus *node, *neighbor_node;
-       	struct	torus *port, *neighbor_port;
+	struct	torus *node_priv, *neighbor_node_priv;
+	struct	torus *port_priv, *neighbor_port_priv;
 	u32	node_id, neighbor_id, nodes;
 
-	toroid = netdev_priv(toroid_dev);
 	nodes =  rows * cols;
-	for_each_torus_node(node_id, nodes) {
-		node_dev = toroid->toroid.node_dev[node_id];
-		node = netdev_priv(node_dev);
-		port_dev =  node->node.port_dev[0];
-		port = netdev_priv(port_dev);
-		neighbor_id = (node_id + cols) % nodes;
-		neighbor_node_dev = toroid->toroid.node_dev[neighbor_id];
-		neighbor_node = netdev_priv(neighbor_node_dev);
-		neighbor_port_dev = neighbor_node->node.port_dev[2];
-		neighbor_port = netdev_priv(neighbor_port_dev);
-		port->port.peer = neighbor_port_dev;
-		neighbor_port->port.peer = port_dev;
+	for (node_id = 0; node_id < nodes; node_id++) {
+		node_dev = priv->toroid.node_dev[node_id];
+		node_priv = netdev_priv(node_dev);
 
-		port_dev =  node->node.port_dev[1];
-		port = netdev_priv(port_dev);
+		port_dev = node_priv->node.port_dev[0];
+		port_priv = netdev_priv(port_dev);
+		neighbor_id = (node_id + cols) % nodes;
+		neighbor_node_dev = priv->toroid.node_dev[neighbor_id];
+		neighbor_node_priv = netdev_priv(neighbor_node_dev);
+		neighbor_port_dev = neighbor_node_priv->node.port_dev[2];
+		neighbor_port_priv = netdev_priv(neighbor_port_dev);
+		port_priv->port.peer = neighbor_port_dev;
+		neighbor_port_priv->port.peer = port_dev;
+
+		port_dev = node_priv->node.port_dev[1];
+		port_priv = netdev_priv(port_dev);
 		neighbor_id =  node_id + 1;
 		if (neighbor_id % cols == 0)
 			neighbor_id -= cols;
-		neighbor_node_dev = toroid->toroid.node_dev[neighbor_id];
-		neighbor_node = netdev_priv(neighbor_node_dev);
-		neighbor_port_dev = neighbor_node->node.port_dev[3];
-		neighbor_port = netdev_priv(neighbor_port_dev);
-		port->port.peer = neighbor_port_dev;
-		neighbor_port->port.peer = port_dev;
+		neighbor_node_dev = priv->toroid.node_dev[neighbor_id];
+		neighbor_node_priv = netdev_priv(neighbor_node_dev);
+		neighbor_port_dev = neighbor_node_priv->node.port_dev[3];
+		neighbor_port_priv = netdev_priv(neighbor_port_dev);
+		port_priv->port.peer = neighbor_port_dev;
+		neighbor_port_priv->port.peer = port_dev;
 	}
 }
 
 static inline int this_newlink_toroid(struct net *src_net,
-				      struct net_device *toroid,
+				      struct net_device *dev,
 				      struct nlattr *tb[],
 				      struct nlattr *data[])
 {
-	struct	torus *t;
-	struct	net *net;
-	struct	net_device *node, *port;
-	char	ifname[IFNAMSIZ];
-	u32	toroid_id, node_id, port_id, rows, cols, nodes, clones;
+	struct	torus *priv = netdev_priv(dev);
+	u32	rows, cols, clones;
+	size_t	sz;
 	int	err;
-#define	__trap(expr)	if (err = (expr), err < 0) goto egress
 
-	t = netdev_priv(toroid);
-	t->mode = TORUS_TOROID_DEV;
-	toroid_id = t->toroid.toroid_id = this_attr(TOROID_ID);
-	torus_toroid_ifname(toroid->name, toroid_id);
+	priv->mode = TORUS_TOROID_DEV;
+	sz = sizeof(*priv->toroid.node_dev);
+	priv->toroid.node_dev = kcalloc(TORUS_NODES, sz, GFP_KERNEL);
+	if (!priv->toroid.node_dev)
+		return -ENOMEM;
+	priv->toroid.toroid_id = this_attr(TOROID_ID);
+	torus_toroid_ifname(dev->name, priv->toroid.toroid_id);
 	rows = this_optional_attr(ROWS, TORUS_DEFAULT_ROWS);
 	cols = this_optional_attr(COLS, TORUS_DEFAULT_COLS);
-	nodes = t->toroid.nodes = rows * cols;
+	priv->toroid.nodes = rows * cols;
 	clones = this_optional_attr(CLONES, TORUS_MIN_CLONES);
-	alloc_this_tbl(t->toroid.node_dev, nodes);
-	torus_set_hw_addr(toroid);
-	if (err = register_netdevice(toroid), err < 0)
+	torus_set_hw_addr(dev);
+	err = register_netdevice(dev);
+	if (err < 0)
 		return err;
-	netif_carrier_off(toroid);
-	net = rtnl_link_get_net(src_net, tb);
-	if (IS_ERR(net))
-		return PTR_ERR(net);
-	for_each_torus_node(node_id, nodes) {
-		torus_node_ifname(ifname, toroid_id, node_id);
-		node = rtnl_create_link(src_net, net, ifname, &torus_rtnl, tb);
-		__trap(IS_ERR(node) ? PTR_ERR(node) : 0 );
-		__trap(this_new_node(net, node, toroid_id, node_id, clones));
-		__trap(torus_set_master(toroid, node));
-		for (port_id = 0; port_id < 4; port_id++) {
-			torus_port_ifname(ifname, toroid_id, node_id, port_id);
-			port = rtnl_create_link(src_net, net, ifname,
-						&torus_rtnl, tb);
-			__trap(IS_ERR(port) ? PTR_ERR(port) : 0);
-			t = netdev_priv(port);
-			t->mode = TORUS_PORT_DEV;
-			t->port.port_id = port_id;
-			__trap(torus_set_master(node, port));
-			torus_set_hw_addr(port);
-			__trap(register_netdevice(port));
-			netif_carrier_off(port);
-		}
-	}
-	this_assign_peers(toroid, rows, cols);
-	err = 0;
-#undef __trap
-egress:
-	put_net(net);
-	return err;
-enomem:
-	return -ENOMEM;
+	netif_carrier_off(dev);
+	err = this_new_toroid_nodes(src_net, dev, tb, clones);
+	if (err < 0)
+		return err;
+	this_assign_peers(priv, rows, cols);
+	torus_create_sysfs(dev);
+	return 0;
 }
 
 static int this_newlink(struct net *net, struct net_device *dev,
@@ -443,22 +481,24 @@ static int this_newlink(struct net *net, struct net_device *dev,
 
 static void this_dellink(struct net_device *dev, struct list_head *head)
 {
-	struct	torus *t = netdev_priv(dev);
+	struct	torus *priv = netdev_priv(dev);
 	struct	net_device *sub;
 	int	i;
 
-	switch (t->mode) {
+	switch (priv->mode) {
 	case TORUS_TOROID_DEV:
-		for_each_torus_node(i, t->toroid.nodes)
-			if (sub = t->toroid.node_dev[i], sub != NULL)
+		for (i = 0; i < priv->toroid.nodes; i++)
+			if (sub = priv->toroid.node_dev[i], sub != NULL)
 				this_dellink(sub, head);
 		break;
 	case TORUS_NODE_DEV:
-		for_each_torus_clone(i, t->node.clones)
-			if (sub = t->node.clone_dev[i], sub != NULL)
-				this_dellink(sub, head);
+		if (priv->node.clone_dev) {
+			for (i = 0; i < priv->node.clones; i++)
+				if (sub = priv->node.clone_dev[i], sub != NULL)
+					this_dellink(sub, head);
+		}
 		for_each_torus_port(i)
-			if (sub = t->node.port_dev[i], sub != NULL) {
+			if (sub = priv->node.port_dev[i], sub != NULL) {
 				if (is_torus(sub))
 					this_dellink(sub, head);
 				else
@@ -468,9 +508,9 @@ static void this_dellink(struct net_device *dev, struct list_head *head)
 	case TORUS_CLONE_DEV:
 		break;
 	case TORUS_PORT_DEV:
-		if (t->port.peer) {
-			t = netdev_priv(t->port.peer);
-			t->port.peer = NULL;
+		if (priv->port.peer) {
+			priv = netdev_priv(priv->port.peer);
+			priv->port.peer = NULL;
 		}
 		break;
 	default:

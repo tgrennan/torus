@@ -32,7 +32,6 @@ ip link set dev DEV master NODE_DEV
 
 #### TODO
 - [ ] forwarding
-- [ ] `sysfs` interface to `toroid2node` and `node2port` tables
-- [ ] `netlink` interface to same
-- [ ] find some way to label routes with torus addresses
+- [ ] `netlink` interface to lookup tables
+- [ ] label routes with torus addresses
 - [ ] node announcement and discovery protocol (kernel thread?)

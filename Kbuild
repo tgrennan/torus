@@ -21,7 +21,7 @@ command-has-def	= $(findstring command line,$(origin $(def)))
 ccflags-def	= $(eval ccflags-y += -D$(def)="$(value $(def))")
 
 obj-m	:= torus.o
-torus-y	:= mod.o rtnl.o netdev.o ethtool.o
+torus-y	:= mod.o rtnl.o netdev.o ethtool.o sysfs.o
 
 ccflags-y := -I$(src) -Werror
 $(foreach def,$(DEFINES),$(if $(command-has-def),$(ccflags-def)))
