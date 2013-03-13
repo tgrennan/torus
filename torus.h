@@ -179,6 +179,18 @@ static inline void torus_addr_set_ttl(u8 *addr, u8 ttl)
 	addr[0] |= ttl << 4;
 }
 
+static inline u8 torus_addr_dec_ttl(u8 *addr)
+{
+	u8	ttl;
+
+	ttl = torus_addr_get_ttl(addr);
+	if (ttl != 0) {
+		ttl -= 1;
+		torus_addr_set_ttl(addr, ttl);
+	}
+	return	ttl;
+}
+
 static inline u8 torus_addr_get_clone(const u8 *addr)
 {
 	return	addr[2] & TORUS_MAX_CLONE_ID;

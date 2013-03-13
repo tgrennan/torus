@@ -17,6 +17,7 @@
 
 #include <linux/kernel.h>
 #include <linux/netdevice.h>
+#include <linux/skbuff.h>
 #include <linux/ethtool.h>
 #include <linux/etherdevice.h>
 #include <linux/torus.h>
@@ -78,39 +79,45 @@ static int this_init(struct net_device *dev)
 static rx_handler_result_t this_rx(struct sk_buff **pskb)
 {
 	struct	net_device *dev = (*pskb)->dev;
+	struct	net_device *rx_dev = dev->master;
 	struct	torus *priv = netdev_priv(dev->master);
-#if 0
-	struct	torus *t = rcu_dereference(dev->rx_handler_data);
-#endif
+	struct	torus *rx_priv = priv;
 	struct	ethhdr *e = eth_hdr(*pskb);
+	struct	sk_buff *cloned_buff;
+	uint	bytes = (*pskb)->len;
+	u8	clone_id;
 
 	if (torus_addr_is_node(e->h_source, priv))
 		goto consume;
-#if 0
-	/* FIXME for port vs node vs peer */
-	if (torus_addr_is_node(e->h_dest, t)) {
-		clone = torus_addr_get_clone(e->h_dest);
-		if (t->clone_dev[clone]) {
-			torus_addr_set_ttl(e->h_dest, 0);
-			if (NET_RX_DROP	==
-			    dev_forward_skb(t->clone_dev[clone],
-					    *pskb))
-				count_drop(&priv->rx);
-			else
-				count_packet(&priv->rx, (*pskb)->len);
-			return RX_HANDLER_CONSUMED;
-		} else {
-			count_error(&priv->rx);
+	if (torus_addr_is_ti(e->h_dest)) {
+		if (torus_addr_is_all_nodes(e->h_dest)) {
+			cloned_buff = skb_clone(*pskb, GFP_ATOMIC);
+			/* FIXME clone skb, dev_queue_xmit node, rx clone*/
+			/* what about dups? should we have a sequence # */
+		} else if (torus_addr_is_node(e->h_source, priv)) {
+			clone_id = torus_addr_get_clone(e->h_source);
+			if (clone_id != 0) {
+				rx_dev = priv->node.clone_dev[clone_id - 1];
+				rx_priv = netdev_priv(rx_dev);
+			}
+			if (dev_forward_skb(rx_dev, *pskb) == NET_RX_SUCCESS) {
+				count_packet(&rx_priv->rx, bytes);
+				return RX_HANDLER_CONSUMED;
+			}
+			count_drop(&rx_priv->rx);
 			goto consume;
+		} else {
+			if (torus_addr_dec_ttl(e->h_dest) != 0) {
+				(*pskb)->dev = dev->master;
+				if (dev_queue_xmit(*pskb) != 0)
+					consume_skb(*pskb);
+				return RX_HANDLER_CONSUMED;
+			}
 		}
 	}
-#else
-	goto consume;
-#endif	/* FIXME */
 #if 0
-	What about broadcast and multicast?
+	What about non-torus packets?
 #endif	/* FIXME */
-	return RX_HANDLER_PASS;
 consume:
 	consume_skb(*pskb);
 	return RX_HANDLER_CONSUMED;
@@ -118,10 +125,62 @@ consume:
 
 static netdev_tx_t this_tx(struct sk_buff *skb, struct net_device *dev)
 {
-	struct	torus *priv = netdev_priv(dev);
+	struct	torus *node_priv, *priv;
+	struct	ethhdr *e = eth_hdr(skb);
+	uint	bytes = skb->len;
+	u16	toroid_id;
+	u8	node_idx, port_idx, **tbl_p;
 
-	/* FIXME */
-	count_error(&priv->tx);
+	node_priv = priv = netdev_priv(dev);
+	switch (priv->mode) {
+	case TORUS_PORT_DEV:
+		/* FIXME  do we need this? */
+		if (skb->ip_summed == CHECKSUM_NONE &&
+		    (dev->features & NETIF_F_RXCSUM))
+			skb->ip_summed = CHECKSUM_UNNECESSARY;
+		if (dev_forward_skb(priv->port.peer, skb) == NET_RX_SUCCESS)
+			count_packet(&priv->tx, bytes);
+		else
+			count_error(&priv->tx);
+		break;
+	case TORUS_CLONE_DEV:
+		node_priv = netdev_priv(dev->master);
+		/* no-break: continue with node reference */
+	case TORUS_NODE_DEV:
+		if (torus_addr_is_ti(e->h_dest)) {
+			if (torus_addr_is_all_nodes(e->h_dest)) {
+				/* FIXME */
+			} else {
+				if (torus_addr_get_ttl(e->h_dest) == 0)
+					torus_addr_set_ttl(e->h_dest,
+							   TORUS_NODE_BITS); 
+				toroid_id = torus_addr_get_toroid(e->h_dest);
+				if (toroid_id != node_priv->node.toroid_id) {
+					tbl_p = &node_priv->node.nodelu[0];
+					node_idx = torus_lookup(tbl_p,
+								toroid_id);
+				} else {
+					node_idx =
+						torus_addr_get_node(e->h_dest);
+				}
+				tbl_p = &node_priv->node.portlu[0];
+				port_idx = torus_lookup(tbl_p, node_idx);
+				if (port_idx < TORUS_PORTS) {
+					skb->dev = node_priv->node.port_dev[port_idx];
+					if (dev_queue_xmit(skb) == 0)
+						count_packet(&priv->tx, bytes);
+					else
+						count_error(&priv->tx);
+				}
+			}
+		}	/* FIXME what to do with non-torus packets? */
+		break;
+	case TORUS_TOROID_DEV:
+		count_error(&priv->tx);
+		break;
+	case TORUS_UNKNOWN_DEV:
+		break;
+	}
 	return NETDEV_TX_OK;
 }
 
