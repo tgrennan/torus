@@ -9,9 +9,12 @@
 *.order
 
 /config
+/config.h
+/ip
 /*.mod.c
-/tags
 /TAGS
+/tags
+/test_header_*.c
 /Module.markers
 /Module.symvers
 

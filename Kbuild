@@ -21,9 +21,16 @@ command-has-def	= $(findstring command line,$(origin $(def)))
 ccflags-def	= $(eval ccflags-y += -D$(def)="$(value $(def))")
 
 obj-m	:= torus.o
-torus-y	:= mod.o rtnl.o netdev.o ethtool.o
+torus-y	:= mod.o rtnl.o netdev.o ethtool.o sysfs.o
 
 ccflags-y := -I$(src) -Werror
+ifneq (,$(wildcard $(src)/config.h))
+	ccflags-y += -include config.h
+$(foreach test_header_c,$(wildcard test_header_*.c),\
+	$(subst .c,,$(test_header_c))-y: -include config.h)
+endif
 $(foreach def,$(DEFINES),$(if $(command-has-def),$(ccflags-def)))
 
+extra-y += iplink_torus.o
+extra-y += ip
 extra-y	+= $(subst .c,.o,$(wildcard test_header_*.c))

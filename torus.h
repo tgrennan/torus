@@ -20,79 +20,70 @@
 
 #include <linux/kernel.h>
 #include <linux/netdevice.h>
-#include <linux/ethtool.h>
 #include <linux/etherdevice.h>
+#include <linux/ethtool.h>
 #include <net/rtnetlink.h>
 #include <linux/torus.h>
 #include <counters.h>
-
-#define	TORUS_INFO(...)							\
-	printk(KERN_INFO TORUS ": " __VA_ARGS__)
-#define	TORUS_ERR(...)							\
-	printk(KERN_ERR TORUS ": " __VA_ARGS__)
+#include <printk.h>
+#include <err.h>
+#include <addr.h>
 
 #ifndef	UNUSED
 #define	UNUSED	__attribute__((__unused__))
-#endif	/* FIXME */
+#endif	/* UNUSED */
 
 #ifndef	PACKED
 #define	PACKED	__attribute__((__packed__))
 #endif	/* PACKED */
 
-#define	TORUS_QUOTE(macro)	# macro
+#define	TORUS_QUOTE(macro)		# macro
 #define	TORUS_EXPANDED_QUOTE(macro)	TORUS_QUOTE(macro)
+#define	TORUS_VERSION_STRING		TORUS_EXPANDED_QUOTE(TORUS_VERSION)
 
-#define	TORUS_VERSION_STRING	TORUS_EXPANDED_QUOTE(TORUS_VERSION)
+#define	TORUS_PORT_MAX		256
+#define	TORUS_PORT_CHUNK	16
+#define	TORUS_LU_TBLS		(TORUS_ALEN - 1)
+#define	TORUS_LU_TBL_ENTRIES	256
+#define	TORUS_LU_SZ		(TORUS_LU_TBLS * TORUS_LU_TBL_ENTRIES)
+#define	TORUS_LU(addr,tbl)	\
+	(((tbl) * TORUS_LU_TBL_ENTRIES) + (addr)[(tbl) + 1])
 
 struct	torus {
-	enum {
-		TORUS_CLONE_DEV,
-		TORUS_NODE_DEV,
-		TORUS_TOROID_DEV,
-		TORUS_PORT_DEV,
-		TORUS_UNKNOWN_DEV
-	}			mode;
 	struct	counters 	rx;
 	struct	counters	tx;
-	union {
-		struct	{
-			u16	clone_id;
-		} clone;
-		struct	{
-			u16	toroid_id;
-			u8	node_id;
-			u16	clones;
-			struct	net_device **clone_dev;
-			struct	net_device **port_dev;
-			u8	*toroid2node;
-			u8	*node2port;
-		} node;
-		struct	{
-			u16	toroid_id;
-			u8	nodes;
-			struct	net_device	**node_dev;
-		} toroid;
-		struct	{
-			u8	port_id;
-			struct	net_device *peer;
-		} port;
-	};
+	spinlock_t		lock;
+	/*
+	 * node is only used by the master of a virtual torus network
+	 * and node[0] is always the master
+	 */
+	struct	net_device	**node;
+	uint			nodes;
+	/*
+	 * port[0] always points back to dev
+	 * port[] grows as necessary by PORTS_CHUNK up to PORTS_MAX
+	 */
+	struct	net_device	**port;
+	uint			ports;
+	/*
+	 * peer[i] is the LLADDR of the node at the other side of the
+	 * point-to-point link from port[i]
+	 */
+	u8			*peer;
+	/*
+	 * Each entry of lu[] is an index to port[] and peer[]
+	 */
+	u8			*lu;
 };
-
-#define	for_each_torus_node(i,nodes)	\
-	for ((i) = 0; (i) < (nodes); (i)++)
-#define	for_each_torus_clone(i,clones)	\
-	for ((i) = TORUS_MIN_CLONE_ID; (i) < (clones); (i)++)
-#define	for_each_torus_port(i)		\
-	for ((i) = 0; (i) < TORUS_PORTS; (i)++)
 
 extern       struct	rtnl_link_ops	torus_rtnl;
 extern const struct	net_device_ops	torus_netdev;
 extern const struct	ethtool_ops	torus_ethtool;
+extern int   create_torus_sysfs(struct net_device *dev);
 
-#define	torus_set_master(master,dev)	\
+#define	set_torus_master(master,dev)	\
 	torus_netdev.ndo_add_slave(master, dev)
-#define	torus_unset_master(master,dev)	\
+#define	unset_torus_master(master,dev)	\
 	torus_netdev.ndo_del_slave(master, dev)
 
 static inline bool is_torus(struct net_device *dev)
@@ -100,119 +91,183 @@ static inline bool is_torus(struct net_device *dev)
 	return dev && dev->netdev_ops == &torus_netdev;
 }
 
-static inline bool torus_mtu_ok(u32 mtu)
+static inline int alloc_torus(struct torus *priv)
 {
-	return mtu >= 64 && mtu <= 1518;
+	struct	net_device **port;
+	u8	*peer, *lu;
+
+	port = kcalloc(TORUS_PORT_CHUNK, sizeof(*port), GFP_KERNEL);
+	gotonerr(err_alloc_port, port ? 0 : -ENOMEM, "alloc port");
+	peer = kcalloc(TORUS_PORT_CHUNK, TORUS_ALEN, GFP_KERNEL);
+	gotonerr(err_alloc_peer, peer ? 0 : -ENOMEM, "alloc peer");
+	lu = kzalloc(TORUS_LU_SZ, GFP_KERNEL);
+	gotonerr(err_alloc_lu, lu ? 0 : -ENOMEM, "alloc lu");
+	priv->ports = TORUS_PORT_CHUNK;
+	rcu_assign_pointer(priv->port, port);
+	rcu_assign_pointer(priv->peer, peer);
+	rcu_assign_pointer(priv->lu, lu);
+	return 0;
+
+err_alloc_lu:
+	kfree(peer);
+err_alloc_peer:
+	kfree(port);
+err_alloc_port:
+	return -ENOMEM;
 }
 
-static inline void torus_addr_set_ti(u8 *addr)
+static inline void free_torus(struct torus *priv)
 {
-	addr[0] = 0x02;	/* local assignment (IEEE802) */
-	addr[1] = 0x42;	/* until someone thinks of something better */
+	kfree(priv->port);
+	kfree(priv->peer);
+	kfree(priv->lu);
 }
 
-static inline bool torus_addr_is_ti(u8 *addr)
+static inline void set_torus_dest(struct torus *priv, struct sk_buff *skb)
 {
-	return (addr[0] & 0xf1) == 0x2 && addr[1] == 0x42;
+	struct	ethhdr *e = (struct ethhdr *)skb->data;
+
+	/* FIXME lookup torus lladdr from ip[v6] addr */
+	e->h_dest[0] = 0;	/* this will drop for now */
 }
 
-static inline u8 torus_addr_get_ttl(const u8 *addr)
+static inline struct net_device *lookup_torus_port(struct torus *priv, u8 *addr)
 {
-	return	(addr[0] >> 4) & 0xf;
+	struct	net_device *dev, **port, *a[TORUS_LU_TBLS];
+	u8	*lu;
+	int	i;
+
+	if (!is_local_ether_addr(addr))
+		return NULL;
+	rcu_read_lock();
+	port = rcu_dereference(priv->port);
+	lu = rcu_dereference(priv->lu);
+	dev = port[0];
+	for (i = 0; i < TORUS_LU_TBLS; i++)
+		a[i] = port[lu[TORUS_LU(addr, i)]];
+	rcu_read_unlock();
+	for (i = 0; i < TORUS_LU_TBLS; i++)
+		if (a[i] != dev)
+			return a[i];
+	return dev;
 }
 
-static inline void torus_addr_set_ttl(u8 *addr, u8 ttl)
+static inline void set_torus_lu(struct torus *priv, u8 *addr, u8 idx, u8 val)
 {
-	addr[0] &= 0xf;
-	addr[0] |= ttl << 4;
+	u8	*lu;
+
+	spin_lock(&priv->lock);
+	lu = rcu_dereference(priv->lu);
+	lu[TORUS_LU(addr, idx)] = val;
+	spin_unlock(&priv->lock);
 }
 
-static inline u8 torus_addr_get_clone(const u8 *addr)
+static inline int alloc_torus_node(struct torus *priv, u32 nodes)
 {
-	return	addr[2];
+	priv->node = kcalloc(nodes, sizeof(*priv->node), GFP_KERNEL);
+	if (!priv->node)
+		return -ENOMEM;
+	priv->nodes = nodes;
+	return 0;
 }
 
-static inline void torus_addr_set_clone(u8 *addr, u8 clone)
+static inline void free_torus_node(struct torus *priv)
 {
-	addr[2] = clone;
+	kfree(priv->node);
+	priv->node = NULL;
+	priv->nodes = 0;
 }
 
-static inline u8 torus_addr_get_node(const u8 *addr)
+static inline int add_torus_port(struct torus *priv, struct net_device *dev)
 {
-	return	addr[3];
+	struct	net_device **old_port, **new_port;
+	u8	*old_peer, *new_peer;
+	int	i, err;
+
+	/*
+	 * we don't have to synchronize with readers to add a dev
+	 * unless we need to expand the port[] and peer[]
+	 */
+	spin_lock(&priv->lock);
+	err = -ENOSPC;
+	for (i = 0; i < TORUS_PORT_MAX; i++)
+		if (i == priv->ports) {
+			err = -ENOMEM;
+			new_port = kcalloc(priv->ports + TORUS_PORT_CHUNK,
+					   sizeof(*priv->port), GFP_KERNEL);
+			if (!new_port)
+				break;
+			new_peer = kcalloc(priv->ports + TORUS_PORT_CHUNK,
+					   TORUS_ALEN, GFP_KERNEL);
+			if (!new_peer) {
+				kfree(new_port);
+				break;
+			}
+			old_port = priv->port;
+			old_peer = priv->peer;
+			memcpy(new_port, rcu_dereference(old_port),
+			       sizeof(*new_port) * priv->ports);
+			memcpy(new_peer, rcu_dereference(old_peer),
+			       TORUS_ALEN * priv->ports);
+			new_port[priv->ports] = dev;
+			priv->ports += TORUS_PORT_CHUNK;
+			rcu_assign_pointer(priv->port, new_port);
+			rcu_assign_pointer(priv->peer, new_peer);
+			synchronize_rcu();
+			kfree(old_port);
+			kfree(old_peer);
+			err = i;
+			break;
+		} else if (priv->port[i] == NULL) {
+			priv->port[i] = dev;
+			err = i;
+			break;
+		}
+	spin_unlock(&priv->lock);
+	return err;
 }
 
-static inline void torus_addr_set_node(u8 *addr, u8 node)
+static inline int rm_torus_port(struct torus *priv, struct net_device *dev)
 {
-	addr[3] = node & TORUS_MAX_NODE_ID;
-}
+	struct	net_device **old_port, **new_port;
+	u8	*old_peer, *new_peer;
+	int	i, err;
 
-static inline u16 torus_addr_get_toroid(const u8 *addr)
-{
-	return	(addr[4] << 8) | addr[5];
-}
-
-static inline void torus_addr_set_toroid(u8 *addr, u16 toroid)
-{
-	addr[4] = (toroid >> 8) & 0xff;
-	addr[5] = toroid & 0xff;
-}
-
-static inline void torus_set_hw_addr(struct net_device *dev)
-{
-	struct	torus *t = netdev_priv(dev);
-	u16	clone_id = 0;
-
-	switch (t->mode) {
-	case TORUS_CLONE_DEV:
-		clone_id = t->clone.clone_id + 1;
-		/* intentional non-break follow through addr setting */
-	case TORUS_NODE_DEV:
-		dev->addr_assign_type |= NET_ADDR_PERM;
-		torus_addr_set_ti(dev->dev_addr);
-		torus_addr_set_clone(dev->dev_addr, clone_id);
-		torus_addr_set_node(dev->dev_addr, t->node.node_id);
-		torus_addr_set_toroid(dev->dev_addr, t->node.toroid_id);
-		break;
-	case TORUS_TOROID_DEV:
-	case TORUS_PORT_DEV:
-		dev->addr_assign_type |= NET_ADDR_RANDOM;
-		random_ether_addr(dev->dev_addr);
-		break;
-	case TORUS_UNKNOWN_DEV:
-		break;
-	}
-}
-
-static inline bool torus_addr_is_node(u8 *addr, struct torus *t)
-{
-	return	torus_addr_is_ti(addr)
-		&& torus_addr_get_toroid(addr) == t->node.toroid_id
-		&& torus_addr_get_node(addr) == t->node.node_id;
-}
-
-static inline void torus_toroid_ifname(char *ifname, __u32 toroid)
-{
-	snprintf(ifname, IFNAMSIZ, TORUS_PREFIX "%u", toroid);
-}
-
-static inline void torus_node_ifname(char *ifname, __u32 toroid, __u32 node)
-{
-	snprintf(ifname, IFNAMSIZ, TORUS_PREFIX "%u.%u", toroid, node);
-}
-
-static inline void torus_clone_ifname(char *ifname, __u32 toroid, __u32 node,
-				      __u32 clone)
-{
-	snprintf(ifname, IFNAMSIZ, TORUS_PREFIX "%u.%u.%u", toroid, node,
-		 clone);
-}
-
-static inline void torus_port_ifname(char *ifname, __u32 toroid, __u32 node,
-				     __u32 port)
-{
-	snprintf(ifname, IFNAMSIZ, TORUS_PREFIX "%u.%u-%u", toroid, node,
-		 port);
+	/* we have to synchronize with readers to remove a dev */
+	spin_lock(&priv->lock);
+	err = -ENODEV;
+	for (i = 0; i < TORUS_PORT_MAX; i++)
+		if (priv->port[i] == dev) {
+			new_port = kcalloc(priv->ports, sizeof(*priv->port),
+					   GFP_KERNEL);
+			if (!new_port) {
+				err = -ENOMEM;
+				break;
+			}
+			new_peer = kcalloc(priv->ports, TORUS_ALEN, GFP_KERNEL);
+			if (!new_peer) {
+				kfree(new_port);
+				err = -ENOMEM;
+				break;
+			}
+			old_port = priv->port;
+			old_peer = priv->peer;
+			memcpy(new_port, rcu_dereference(old_port),
+			       sizeof(*new_port) * priv->ports);
+			memcpy(new_peer, rcu_dereference(old_peer),
+			       TORUS_ALEN * priv->ports);
+			new_port[i] = NULL;
+			memset(new_peer + (i * TORUS_ALEN), 0, TORUS_ALEN);
+			rcu_assign_pointer(priv->port, new_port);
+			rcu_assign_pointer(priv->peer, new_peer);
+			synchronize_rcu();
+			kfree(old_port);
+			kfree(old_peer);
+			err = 0;
+			break;
+		}
+	spin_unlock(&priv->lock);
+	return err;
 }
 
 #endif /* __TORUS_H__ */
